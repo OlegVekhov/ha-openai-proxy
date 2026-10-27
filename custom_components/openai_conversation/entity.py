@@ -148,6 +148,30 @@ def _format_tool(
     if unsupported_keys.intersection(schema):
         schema = {k: v for k, v in schema.items() if k not in unsupported_keys}
 
+    # probatio can emit its internal _Unsupported sentinel for portions of
+    # Home Assistant tool schemas. The OpenAI SDK cannot JSON-encode it.
+    # Remove only unsupported schema attributes while preserving valid ones.
+    def clean_unsupported(value: Any) -> Any:
+        if type(value).__name__ == "_Unsupported":
+            return None
+        if isinstance(value, dict):
+            return {
+                key: clean_unsupported(item)
+                for key, item in value.items()
+                if type(item).__name__ != "_Unsupported"
+            }
+        if isinstance(value, list):
+            return [
+                clean_unsupported(item)
+                for item in value
+                if type(item).__name__ != "_Unsupported"
+            ]
+        return value
+
+    schema = clean_unsupported(schema)
+    if not isinstance(schema, dict):
+        schema = {"type": "object", "properties": {}}
+
     return FunctionToolParam(
         type="function",
         name=tool.name,
