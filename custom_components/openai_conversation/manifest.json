@@ -16,7 +16,8 @@
   "quality_scale": "bronze",
   "requirements": [
     "openai==3.10.0",
-    "socksio==1.0.0"
+    "socksio==1.0.0",
+    "voluptuous-openapi==0.4.1"
   ],
-  "version": "2026.4.0.1"
+  "version": "2026.4.0.2"
 }
