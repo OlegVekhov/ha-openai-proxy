@@ -1,19 +1,17 @@
 """Config flow for OpenAI Conversation integration."""
 
-from __future__ import annotations
-
 from collections.abc import Mapping
 import json
 import logging
-from typing import Any
+from typing import Any, cast, override
 
 import openai
-import voluptuous as vol
-from voluptuous_openapi import convert
+import probatio
 
 from homeassistant.components.zone import ENTITY_ID_HOME
 from homeassistant.config_entries import (
     SOURCE_REAUTH,
+    SOURCE_RECONFIGURE,
     ConfigEntry,
     ConfigEntryState,
     ConfigFlow,
@@ -22,11 +20,11 @@ from homeassistant.config_entries import (
     SubentryFlowResult,
 )
 from homeassistant.const import (
-    ATTR_LATITUDE,
-    ATTR_LONGITUDE,
     CONF_API_KEY,
     CONF_LLM_HASS_API,
     CONF_NAME,
+    CONF_PROMPT,
+    EntityStateAttribute,
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import llm
@@ -46,19 +44,26 @@ from homeassistant.helpers.selector import (
 from homeassistant.helpers.typing import VolDictType
 
 from .proxy import (
-    make_client, CONF_PROXY_TYPE, CONF_PROXY_HOST, CONF_PROXY_PORT,
-    CONF_PROXY_USERNAME, CONF_PROXY_PASSWORD, PROXY_TYPES,
+    make_client,
+    proxy_enabled,
+    CONF_PROXY_TYPE,
+    CONF_PROXY_HOST,
+    CONF_PROXY_PORT,
+    CONF_PROXY_USERNAME,
+    CONF_PROXY_PASSWORD,
+    PROXY_TYPES,
 )
 from .const import (
     CONF_CHAT_MODEL,
     CONF_CODE_INTERPRETER,
     CONF_IMAGE_MODEL,
     CONF_MAX_TOKENS,
-    CONF_PROMPT,
+    CONF_PRO_MODE,
     CONF_REASONING_EFFORT,
     CONF_REASONING_SUMMARY,
     CONF_RECOMMENDED,
     CONF_SERVICE_TIER,
+    CONF_STORE_RESPONSES,
     CONF_TEMPERATURE,
     CONF_TOP_P,
     CONF_TTS_SPEED,
@@ -83,9 +88,11 @@ from .const import (
     RECOMMENDED_CONVERSATION_OPTIONS,
     RECOMMENDED_IMAGE_MODEL,
     RECOMMENDED_MAX_TOKENS,
+    RECOMMENDED_PRO_MODE,
     RECOMMENDED_REASONING_EFFORT,
     RECOMMENDED_REASONING_SUMMARY,
     RECOMMENDED_SERVICE_TIER,
+    RECOMMENDED_STORE_RESPONSES,
     RECOMMENDED_STT_MODEL,
     RECOMMENDED_STT_OPTIONS,
     RECOMMENDED_TEMPERATURE,
@@ -107,14 +114,14 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-STEP_USER_DATA_SCHEMA = vol.Schema(
+STEP_USER_DATA_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_API_KEY): str,
-        vol.Required(CONF_PROXY_TYPE, default="http"): vol.In(PROXY_TYPES),
-        vol.Optional(CONF_PROXY_HOST): str,
-        vol.Optional(CONF_PROXY_PORT): vol.All(vol.Coerce(int), vol.Range(min=1, max=65535)),
-        vol.Optional(CONF_PROXY_USERNAME): str,
-        vol.Optional(CONF_PROXY_PASSWORD): str,
+        probatio.Required(CONF_API_KEY): str,
+        probatio.Required(CONF_PROXY_TYPE, default="none"): probatio.In(PROXY_TYPES),
+        probatio.Optional(CONF_PROXY_HOST): str,
+        probatio.Optional(CONF_PROXY_PORT): int,
+        probatio.Optional(CONF_PROXY_USERNAME): str,
+        probatio.Optional(CONF_PROXY_PASSWORD): str,
     }
 )
 
@@ -128,7 +135,7 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> None:
     try:
         await client.models.list(timeout=10.0)
     finally:
-        if data.get(CONF_PROXY_TYPE, "none") != "none":
+        if proxy_enabled(data):
             await client.close()
 
 
@@ -136,13 +143,19 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for OpenAI Conversation."""
 
     VERSION = 2
-    MINOR_VERSION = 6
+    MINOR_VERSION = 7
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Handle the initial step."""
+        return await self._async_step_api_key(user_input, "user")
 
+    async def _async_step_api_key(
+        self, user_input: dict[str, Any] | None, step_id: str
+    ) -> ConfigFlowResult:
+        """Handle an API key form."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
@@ -157,9 +170,18 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
                 _LOGGER.exception("Unexpected exception")
                 errors["base"] = "unknown"
             else:
-                if self.source == SOURCE_REAUTH:
+                if self.source in (SOURCE_REAUTH, SOURCE_RECONFIGURE):
+                    entry = (
+                        self._get_reauth_entry()
+                        if self.source == SOURCE_REAUTH
+                        else self._get_reconfigure_entry()
+                    )
+                    if entry.update_listeners:
+                        return self.async_update_and_abort(
+                            entry, data_updates=user_input
+                        )
                     return self.async_update_reload_and_abort(
-                        self._get_reauth_entry(), data_updates=user_input
+                        entry, data_updates=user_input
                     )
                 return self.async_create_entry(
                     title="ChatGPT",
@@ -193,13 +215,13 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
                 )
 
         return self.async_show_form(
-            step_id="user",
+            step_id=step_id,
             data_schema=self.add_suggested_values_to_schema(
                 STEP_USER_DATA_SCHEMA, user_input
             ),
             errors=errors,
             description_placeholders={
-                "instructions_url": "https://www.home-assistant.io/integrations/openai_conversation/#generate-an-api-key",
+                "instructions_url": "https://www.home-assistant.io/integrations/openai_conversation/#prerequisites",
             },
         )
 
@@ -213,15 +235,17 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Dialog that informs the user that reauth is required."""
-        if not user_input:
-            return self.async_show_form(
-                step_id="reauth_confirm", data_schema=STEP_USER_DATA_SCHEMA
-            )
+        return await self._async_step_api_key(user_input, "reauth_confirm")
 
-        return await self.async_step_user(user_input)
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle reconfiguration of the API key."""
+        return await self._async_step_api_key(user_input, "reconfigure")
 
     @classmethod
     @callback
+    @override
     def async_get_supported_subentry_types(
         cls, config_entry: ConfigEntry
     ) -> dict[str, type[ConfigSubentryFlow]]:
@@ -266,7 +290,7 @@ class OpenAISubentryFlowHandler(ConfigSubentryFlow):
     ) -> SubentryFlowResult:
         """Manage initial options."""
         # abort if entry is not loaded
-        if self._get_entry().state != ConfigEntryState.LOADED:
+        if self._get_entry().state is not ConfigEntryState.LOADED:
             return self.async_abort(reason="entry_not_loaded")
 
         options = self.options
@@ -293,12 +317,12 @@ class OpenAISubentryFlowHandler(ConfigSubentryFlow):
                 default_name = DEFAULT_AI_TASK_NAME
             else:
                 default_name = DEFAULT_CONVERSATION_NAME
-            step_schema[vol.Required(CONF_NAME, default=default_name)] = str
+            step_schema[probatio.Required(CONF_NAME, default=default_name)] = str
 
         if self._subentry_type == "conversation":
             step_schema.update(
                 {
-                    vol.Optional(
+                    probatio.Optional(
                         CONF_PROMPT,
                         description={
                             "suggested_value": options.get(
@@ -306,18 +330,20 @@ class OpenAISubentryFlowHandler(ConfigSubentryFlow):
                             )
                         },
                     ): TemplateSelector(),
-                    vol.Optional(CONF_LLM_HASS_API): SelectSelector(
+                    probatio.Optional(CONF_LLM_HASS_API): SelectSelector(
                         SelectSelectorConfig(options=hass_apis, multiple=True)
                     ),
                 }
             )
 
         step_schema[
-            vol.Required(CONF_RECOMMENDED, default=options.get(CONF_RECOMMENDED, False))
+            probatio.Required(
+                CONF_RECOMMENDED, default=options.get(CONF_RECOMMENDED, False)
+            )
         ] = bool
 
         if user_input is not None:
-            if not user_input.get(CONF_LLM_HASS_API):
+            if user_input.get(CONF_LLM_HASS_API) is None:
                 user_input.pop(CONF_LLM_HASS_API, None)
 
             if user_input[CONF_RECOMMENDED]:
@@ -335,39 +361,43 @@ class OpenAISubentryFlowHandler(ConfigSubentryFlow):
             options.update(user_input)
             if CONF_LLM_HASS_API in options and CONF_LLM_HASS_API not in user_input:
                 options.pop(CONF_LLM_HASS_API)
-            return await self.async_step_advanced()
+            return await self.async_step_additional()
 
         return self.async_show_form(
             step_id="init",
             data_schema=self.add_suggested_values_to_schema(
-                vol.Schema(step_schema), options
+                probatio.Schema(step_schema), options
             ),
         )
 
-    async def async_step_advanced(
+    async def async_step_additional(
         self, user_input: dict[str, Any] | None = None
     ) -> SubentryFlowResult:
-        """Manage advanced options."""
+        """Manage additional options."""
         options = self.options
         errors: dict[str, str] = {}
 
         step_schema: VolDictType = {
-            vol.Optional(
+            probatio.Optional(
                 CONF_CHAT_MODEL,
                 default=RECOMMENDED_CHAT_MODEL,
             ): str,
-            vol.Optional(
+            probatio.Optional(
                 CONF_MAX_TOKENS,
                 default=RECOMMENDED_MAX_TOKENS,
             ): int,
-            vol.Optional(
+            probatio.Optional(
                 CONF_TOP_P,
                 default=RECOMMENDED_TOP_P,
             ): NumberSelector(NumberSelectorConfig(min=0, max=1, step=0.05)),
-            vol.Optional(
+            probatio.Optional(
                 CONF_TEMPERATURE,
                 default=RECOMMENDED_TEMPERATURE,
             ): NumberSelector(NumberSelectorConfig(min=0, max=2, step=0.05)),
+            probatio.Optional(
+                CONF_STORE_RESPONSES,
+                default=RECOMMENDED_STORE_RESPONSES,
+            ): bool,
         }
 
         if user_input is not None:
@@ -379,9 +409,9 @@ class OpenAISubentryFlowHandler(ConfigSubentryFlow):
                 return await self.async_step_model()
 
         return self.async_show_form(
-            step_id="advanced",
+            step_id="additional",
             data_schema=self.add_suggested_values_to_schema(
-                vol.Schema(step_schema), options
+                probatio.Schema(step_schema), options
             ),
             errors=errors,
         )
@@ -400,7 +430,7 @@ class OpenAISubentryFlowHandler(ConfigSubentryFlow):
         if not model.startswith(tuple(UNSUPPORTED_CODE_INTERPRETER_MODELS)):
             step_schema.update(
                 {
-                    vol.Optional(
+                    probatio.Optional(
                         CONF_CODE_INTERPRETER,
                         default=RECOMMENDED_CODE_INTERPRETER,
                     ): bool,
@@ -412,7 +442,7 @@ class OpenAISubentryFlowHandler(ConfigSubentryFlow):
         if reasoning_options := self._get_reasoning_options(model):
             step_schema.update(
                 {
-                    vol.Optional(
+                    probatio.Optional(
                         CONF_REASONING_EFFORT,
                         default=RECOMMENDED_REASONING_EFFORT,
                     ): SelectSelector(
@@ -427,10 +457,22 @@ class OpenAISubentryFlowHandler(ConfigSubentryFlow):
         elif CONF_REASONING_EFFORT in options:
             options.pop(CONF_REASONING_EFFORT)
 
-        if model.startswith("gpt-5"):
+        if model.startswith(("gpt-5.6", "gpt-6")):
             step_schema.update(
                 {
-                    vol.Optional(
+                    probatio.Optional(
+                        CONF_PRO_MODE,
+                        default=RECOMMENDED_PRO_MODE,
+                    ): bool,
+                }
+            )
+        elif CONF_PRO_MODE in options:
+            options.pop(CONF_PRO_MODE)
+
+        if model.startswith(("gpt-5", "gpt-6")):
+            step_schema.update(
+                {
+                    probatio.Optional(
                         CONF_VERBOSITY,
                         default=RECOMMENDED_VERBOSITY,
                     ): SelectSelector(
@@ -440,28 +482,42 @@ class OpenAISubentryFlowHandler(ConfigSubentryFlow):
                             mode=SelectSelectorMode.DROPDOWN,
                         )
                     ),
-                    vol.Optional(
+                }
+            )
+        elif CONF_VERBOSITY in options:
+            options.pop(CONF_VERBOSITY)
+
+        if model.startswith(("o", "gpt-5", "gpt-6")):
+            reasoning_summary_options = ["off", "auto", "concise", "detailed"]
+            if model.startswith("o"):
+                reasoning_summary_options.remove("concise")
+            stored_summary = options.get(
+                CONF_REASONING_SUMMARY, RECOMMENDED_REASONING_SUMMARY
+            )
+            if stored_summary not in reasoning_summary_options:
+                stored_summary = RECOMMENDED_REASONING_SUMMARY
+                options[CONF_REASONING_SUMMARY] = stored_summary
+            step_schema.update(
+                {
+                    probatio.Optional(
                         CONF_REASONING_SUMMARY,
-                        default=RECOMMENDED_REASONING_SUMMARY,
+                        default=stored_summary,
                     ): SelectSelector(
                         SelectSelectorConfig(
-                            options=["off", "auto", "short", "detailed"],
+                            options=reasoning_summary_options,
                             translation_key=CONF_REASONING_SUMMARY,
                             mode=SelectSelectorMode.DROPDOWN,
                         )
                     ),
                 }
             )
-        elif CONF_VERBOSITY in options:
-            options.pop(CONF_VERBOSITY)
-        if CONF_REASONING_SUMMARY in options:
-            if not model.startswith("gpt-5"):
-                options.pop(CONF_REASONING_SUMMARY)
+        elif CONF_REASONING_SUMMARY in options:
+            options.pop(CONF_REASONING_SUMMARY)
 
         service_tiers = self._get_service_tiers(model)
         if "flex" in service_tiers or "priority" in service_tiers:
             step_schema[
-                vol.Optional(
+                probatio.Optional(
                     CONF_SERVICE_TIER,
                     default=RECOMMENDED_SERVICE_TIER,
                 )
@@ -482,11 +538,11 @@ class OpenAISubentryFlowHandler(ConfigSubentryFlow):
         ):
             step_schema.update(
                 {
-                    vol.Optional(
+                    probatio.Optional(
                         CONF_WEB_SEARCH,
                         default=RECOMMENDED_WEB_SEARCH,
                     ): bool,
-                    vol.Optional(
+                    probatio.Optional(
                         CONF_WEB_SEARCH_CONTEXT_SIZE,
                         default=RECOMMENDED_WEB_SEARCH_CONTEXT_SIZE,
                     ): SelectSelector(
@@ -496,11 +552,11 @@ class OpenAISubentryFlowHandler(ConfigSubentryFlow):
                             mode=SelectSelectorMode.DROPDOWN,
                         )
                     ),
-                    vol.Optional(
+                    probatio.Optional(
                         CONF_WEB_SEARCH_USER_LOCATION,
                         default=RECOMMENDED_WEB_SEARCH_USER_LOCATION,
                     ): bool,
-                    vol.Optional(
+                    probatio.Optional(
                         CONF_WEB_SEARCH_INLINE_CITATIONS,
                         default=RECOMMENDED_WEB_SEARCH_INLINE_CITATIONS,
                     ): bool,
@@ -527,10 +583,17 @@ class OpenAISubentryFlowHandler(ConfigSubentryFlow):
             tuple(UNSUPPORTED_IMAGE_MODELS)
         ):
             step_schema[
-                vol.Optional(CONF_IMAGE_MODEL, default=RECOMMENDED_IMAGE_MODEL)
+                probatio.Optional(CONF_IMAGE_MODEL, default=RECOMMENDED_IMAGE_MODEL)
             ] = SelectSelector(
                 SelectSelectorConfig(
-                    options=["gpt-image-1.5", "gpt-image-1", "gpt-image-1-mini"],
+                    options=[
+                        "gpt-image-2.5-sunburst",
+                        "gpt-image-2.5-flare",
+                        "gpt-image-2",
+                        "gpt-image-1.5",
+                        "gpt-image-1",
+                        "gpt-image-1-mini",
+                    ],
                     mode=SelectSelectorMode.DROPDOWN,
                 )
             )
@@ -568,19 +631,24 @@ class OpenAISubentryFlowHandler(ConfigSubentryFlow):
         return self.async_show_form(
             step_id="model",
             data_schema=self.add_suggested_values_to_schema(
-                vol.Schema(step_schema), options
+                probatio.Schema(step_schema), options
             ),
             errors=errors,
         )
 
     def _get_reasoning_options(self, model: str) -> list[str]:
         """Get reasoning effort options based on model."""
-        if not model.startswith(("o", "gpt-5")) or model.startswith("gpt-5-pro"):
+        if not model.startswith(("o", "gpt-5", "gpt-6")) or model.startswith(
+            "gpt-5-pro"
+        ):
             return []
 
         models_reasoning_map: dict[str | tuple[str, ...], list[str]] = {
-            ("gpt-5.2-pro", "gpt-5.4-pro"): ["medium", "high", "xhigh"],
-            ("gpt-5.2", "gpt-5.3", "gpt-5.4"): [
+            "gpt-6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
+            "gpt-6": ["low", "medium", "high", "xhigh", "max"],
+            "gpt-5.6": ["none", "low", "medium", "high", "xhigh", "max"],
+            ("gpt-5.2-pro", "gpt-5.4-pro", "gpt-5.5-pro"): ["medium", "high", "xhigh"],
+            ("gpt-5.2", "gpt-5.3", "gpt-5.4", "gpt-5.5"): [
                 "none",
                 "low",
                 "medium",
@@ -616,17 +684,16 @@ class OpenAISubentryFlowHandler(ConfigSubentryFlow):
         location_data: dict[str, str] = {}
         zone_home = self.hass.states.get(ENTITY_ID_HOME)
         if zone_home is not None:
-            client = openai.AsyncOpenAI(
-                api_key=self._get_entry().data[CONF_API_KEY],
-                http_client=get_async_client(self.hass),
-            )
-            location_schema = vol.Schema(
+            client = make_client(self.hass, self._get_entry().data)
+            location_schema = probatio.Schema(
                 {
-                    vol.Optional(
+                    probatio.Optional(
                         CONF_WEB_SEARCH_CITY,
-                        description="Free text input for the city, e.g. `San Francisco`",
+                        description=(
+                            "Free text input for the city, e.g. `San Francisco`"
+                        ),
                     ): str,
-                    vol.Optional(
+                    probatio.Optional(
                         CONF_WEB_SEARCH_REGION,
                         description="Free text input for the region, e.g. `California`",
                     ): str,
@@ -638,8 +705,8 @@ class OpenAISubentryFlowHandler(ConfigSubentryFlow):
                     {
                         "role": "system",
                         "content": "Where are the following coordinates located: "
-                        f"({zone_home.attributes[ATTR_LATITUDE]},"
-                        f" {zone_home.attributes[ATTR_LONGITUDE]})?",
+                        f"({zone_home.attributes[EntityStateAttribute.LATITUDE]},"
+                        f" {zone_home.attributes[EntityStateAttribute.LONGITUDE]})?",
                     }
                 ],
                 text={
@@ -648,11 +715,15 @@ class OpenAISubentryFlowHandler(ConfigSubentryFlow):
                         "name": "approximate_location",
                         "description": "Approximate location data of the user "
                         "for refined web search results",
-                        "schema": convert(location_schema),
+                        "schema": probatio.to_openapi(
+                            location_schema, openapi_version="3.1.0"
+                        ),
                         "strict": False,
                     }
                 },
-                store=False,
+                store=self.options.get(
+                    CONF_STORE_RESPONSES, RECOMMENDED_STORE_RESPONSES
+                ),
             )
             location_data = location_schema(json.loads(response.output_text) or {})
 
@@ -694,7 +765,7 @@ class OpenAISubentrySTTFlowHandler(ConfigSubentryFlow):
     ) -> SubentryFlowResult:
         """Manage initial options."""
         # abort if entry is not loaded
-        if self._get_entry().state != ConfigEntryState.LOADED:
+        if self._get_entry().state is not ConfigEntryState.LOADED:
             return self.async_abort(reason="entry_not_loaded")
 
         options = self.options
@@ -703,11 +774,11 @@ class OpenAISubentrySTTFlowHandler(ConfigSubentryFlow):
         step_schema: VolDictType = {}
 
         if self._is_new:
-            step_schema[vol.Required(CONF_NAME, default=DEFAULT_STT_NAME)] = str
+            step_schema[probatio.Required(CONF_NAME, default=DEFAULT_STT_NAME)] = str
 
         step_schema.update(
             {
-                vol.Optional(
+                probatio.Optional(
                     CONF_PROMPT,
                     description={
                         "suggested_value": options.get(CONF_PROMPT, DEFAULT_STT_PROMPT)
@@ -715,7 +786,7 @@ class OpenAISubentrySTTFlowHandler(ConfigSubentryFlow):
                 ): TextSelector(
                     TextSelectorConfig(multiline=True, type=TextSelectorType.TEXT)
                 ),
-                vol.Optional(
+                probatio.Optional(
                     CONF_CHAT_MODEL, default=RECOMMENDED_STT_MODEL
                 ): SelectSelector(
                     SelectSelectorConfig(
@@ -748,7 +819,7 @@ class OpenAISubentrySTTFlowHandler(ConfigSubentryFlow):
         return self.async_show_form(
             step_id="init",
             data_schema=self.add_suggested_values_to_schema(
-                vol.Schema(step_schema), options
+                probatio.Schema(step_schema), options
             ),
             errors=errors,
         )
@@ -783,7 +854,7 @@ class OpenAISubentryTTSFlowHandler(ConfigSubentryFlow):
     ) -> SubentryFlowResult:
         """Manage initial options."""
         # abort if entry is not loaded
-        if self._get_entry().state != ConfigEntryState.LOADED:
+        if self._get_entry().state is not ConfigEntryState.LOADED:
             return self.async_abort(reason="entry_not_loaded")
 
         options = self.options
@@ -792,14 +863,14 @@ class OpenAISubentryTTSFlowHandler(ConfigSubentryFlow):
         step_schema: VolDictType = {}
 
         if self._is_new:
-            step_schema[vol.Required(CONF_NAME, default=DEFAULT_TTS_NAME)] = str
+            step_schema[probatio.Required(CONF_NAME, default=DEFAULT_TTS_NAME)] = str
 
         step_schema.update(
             {
-                vol.Optional(CONF_PROMPT): TextSelector(
+                probatio.Optional(CONF_PROMPT): TextSelector(
                     TextSelectorConfig(multiline=True, type=TextSelectorType.TEXT)
                 ),
-                vol.Optional(
+                probatio.Optional(
                     CONF_TTS_SPEED, default=RECOMMENDED_TTS_SPEED
                 ): NumberSelector(NumberSelectorConfig(min=0.25, max=4.0, step=0.01)),
             }
@@ -822,7 +893,7 @@ class OpenAISubentryTTSFlowHandler(ConfigSubentryFlow):
         return self.async_show_form(
             step_id="init",
             data_schema=self.add_suggested_values_to_schema(
-                vol.Schema(step_schema), options
+                probatio.Schema(step_schema), options
             ),
             errors=errors,
         )

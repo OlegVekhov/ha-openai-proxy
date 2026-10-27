@@ -1,15 +1,15 @@
-# Home Assistant OpenAI Conversation Proxy
+# OpenAI Conversation Proxy for Home Assistant 2026.10.4
 
-Snapshot of the official Home Assistant Core [OpenAI integration](https://github.com/home-assistant/core/tree/2026.4.0/homeassistant/components/openai_conversation) at upstream tag **2026.4.0**, plus independent optional proxy support.
+Custom distribution of the official [Home Assistant Core 2026.10.4 OpenAI integration](https://github.com/home-assistant/core/tree/2026.10.4/homeassistant/components/openai_conversation) with per-integration HTTP/HTTPS/SOCKS5 proxy.
 
-**Initial setup fields:** OpenAI API key; proxy type (none, HTTP, HTTPS, SOCKS5); proxy address; proxy port; proxy username and password. Credentials are URL encoded automatically and stored locally by Home Assistant, never committed to GitHub.
+This is **not a fork of the whole Home Assistant Core monorepo**. Rebase manually against the upstream integration folder on release updates.
 
 ## Installation
-Add `https://github.com/OlegVekhov/ha-openai-proxy` to HACS Custom repositories with category **Integration**. Download, restart Home Assistant, and add the OpenAI integration. Back up the Home Assistant configuration before installing: the custom integration overrides the built-in `openai_conversation` domain.
 
-**Compatibility:** Upstream tag 2026.4.0; compatibility with Core 2026.4.10 has not been tested. Updates to Home Assistant require syncing new upstream integration sources and reapplying proxy changes.
+Add `https://github.com/OlegVekhov/ha-openai-proxy` as an **Integration** in HACS custom repositories, download, restart Home Assistant, and add OpenAI. The custom integration uses the built-in `openai_conversation` domain, overriding the built-in component. Back up configuration first.
 
-Proxy config fields currently appear only on *new* integration setup. If an OpenAI entry already exists, back up configuration and recreate that entry to change the proxy.
+Initial and reconfigure/reauth forms include: OpenAI API key, proxy type (none/http/https/socks5), host/IP (without scheme), port, username, password. Special characters are safely URL-encoded. Data is stored locally as HA config entry secrets (not in this repository).
 
-## Maintenance
-This is intentionally not a GitHub fork of the entire `home-assistant/core` monorepo. Update by comparing the `homeassistant/components/openai_conversation` files in a newer Home Assistant tag with the corresponding files under `custom_components/openai_conversation`, then reapply patches.
+The manifest intentionally retains **only the official OpenAI SDK requirement `openai==3.10.0`**. All other code comes from upstream 2026.10.4 except proxy additions.
+
+**Caution:** The code is not yet validated in a running Home Assistant installation. Verify after updating via HACS, and check logs for failures. The separate web-search location lookup also creates an OpenAI client and is routed using the proxy-aware client factory.

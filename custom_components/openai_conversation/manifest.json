@@ -5,7 +5,9 @@
     "assist_pipeline",
     "intent"
   ],
-  "codeowners": [],
+  "codeowners": [
+    "@Shulyaka"
+  ],
   "config_flow": true,
   "dependencies": [
     "conversation"
@@ -15,9 +17,7 @@
   "iot_class": "cloud_polling",
   "quality_scale": "bronze",
   "requirements": [
-    "openai==3.10.0",
-    "socksio==1.0.0",
-    "voluptuous-openapi==0.4.1"
+    "openai==3.10.0"
   ],
-  "version": "2026.4.0.2"
+  "version": "2026.10.4.1"
 }
